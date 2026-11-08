@@ -28,6 +28,7 @@ static int s2pad_player(s2_pad *d);   // the Switch 2 pads' player slots (below,
 static void s2pad_read(s2_pad *d);
 static int g_merge_s2_rumble;   // DM_PAD_MERGE: player 1's rumble goes to the Switch 2 pads (merge_rumble_to_s2)
 static void merge_rumble_to_s2(int on);
+#include "pad_net.h"
 #include "home_quit.h"
 #include "home_quit_mac.h"
 #include "ctrl_prompt.h"
@@ -299,6 +300,40 @@ static void pads_changed(GCController *gone) {
     pro_players_changed(gone);
     cp_poll();   // a controller came or went while the controller applet's prompt is up
 }
+// DM_PAD_UDP=<port>[@<address>] (pad_net.h): a pad on another machine, a Steam Deck streaming through Steam Link (whose Steam Input makes no gamepad on macOS: the Deck's controls come as
+// keyboard and mouse), sends its state over UDP and plays as one more controller: a slot of its own (player 1 with DM_PAD_MERGE), sticks analog, read as pad_read does, only while the
+// game window is key. The sender going silent frees the slot. scripts/deck_pad_bridge.py is the sender
+static pad_net g_net;
+static const char g_net_owner = 0;   // the slot table's key for it
+static int g_net_live, g_net_p = -1;   // main thread: a sender is talking; its player (-1: none, every slot is taken)
+static pad_net_state g_net_st;
+static int net_player(void) { return g_merge ? 0 : g_net_p; }
+static void net_pad_apply(void) {   // the sender's last state to the game
+    int p = net_player();
+    if (!g_net_live || p < 0 || !g_input_on) return;
+    hq_poll(); if (hq_blocks_input(g_hq.phase)) return;
+    if (cp_poll()) return;   // the controller applet's prompt has the controllers (front_ctrl_support)
+    pad_set(p, g_net_st.buttons, g_net_st.lx, g_net_st.ly, g_net_st.rx, g_net_st.ry);
+}
+static void net_pad_state(int connected, pad_net_state st) {   // main thread
+    char nb[16];
+    if (connected && !g_net_live) {
+        g_net_live = 1;
+        if (g_merge) LOG("network pad (DM_PAD_UDP): connected: player 1 (DM_PAD_MERGE)");
+        else if ((g_net_p = pad_slot_take(&g_slots, &g_net_owner, "network pad")) < 0) LOG("network pad (DM_PAD_UDP): connected, but all %d players are taken, not used", DM_PLAYERS);
+        else { npad_name(g_net_p, nb, sizeof nb); LOG("network pad (DM_PAD_UDP): connected: player %d (npad %s)", g_net_p + 1, nb); dm_pad_players(pad_slot_mask(&g_slots)); }
+    }
+    if (connected) { g_net_st = st; net_pad_apply(); return; }
+    if (!g_net_live) return;
+    int p = net_player(); g_net_live = 0;
+    if (p >= 0) dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
+    if (!g_merge && g_net_p >= 0) { pad_slot_free(&g_slots, &g_net_owner); g_net_p = -1; dm_pad_players(pad_slot_mask(&g_slots)); }
+    LOG("network pad (DM_PAD_UDP): the sender went silent: released");
+}
+static void net_pad_event(void *user, int connected, const pad_net_state *st) {   // the receiver's thread: to the main thread, in order
+    (void)user; pad_net_state s = *st;
+    dispatch_async(dispatch_get_main_queue(), ^{ net_pad_state(connected, s); });
+}
 // Display sleep: macOS counts keyboard and mouse input as user activity, not a controller's, so in controller-only play the display dims and locks; the latency
 // activity in front_run keeps the system awake, not the display. While the game window is key the display stays awake (NSActivityIdleDisplaySleepDisabled);
 // losing focus or being minimized lets it sleep again. An explicit lock or sleep is not held off, and no input is synthesized
@@ -314,6 +349,7 @@ static void display_awake(int on) {
 static int g_mouse_down;   // the mouse holds the touch (DmGameView)
 // Nothing the controllers pressed stays pressed (focus lost, the Home quit prompt open)
 static void pads_release(void) {
+    if (g_net_live && net_player() >= 0) dm_pad_set_player(net_player(), 0, 0, 0, 0, 0);
     if (g_merge) { if (merge_pads_left(nil)) dm_pad_set(0, 0, 0, 0, 0); return; }
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
     for (hid_pad *d = g_hidpads; d; d = d->next) { int p = pad_slot_of(&g_slots, d); if (p >= 0) dm_pad_set_player(p, 0, 0, 0, 0, 0); }
@@ -328,6 +364,7 @@ static void pads_reread(void) {
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) pad_read(g_held[p].extendedGamepad);
     for (hid_pad *d = g_hidpads; d; d = d->next) hidpad_read(d);
     for (s2_pad *d = dm_switch2_pads(); d; d = d->next) s2pad_read(d);
+    net_pad_apply();
 }
 static void hq_close(void);
 static void input_release(void) {
@@ -606,6 +643,11 @@ static void pads_start(void) {
     hidpad_start();
     static const dm_switch2_front s2front = {s2pad_attach, s2pad_detach, s2pad_read, s2pad_player, s2pad_blocked};
     dm_switch2_start(&s2front);
+    const char *u = getenv("DM_PAD_UDP");
+    if (u && *u) {
+        if (pad_net_open(&g_net, u, net_pad_event, NULL)) LOG("[RED] DM_PAD_UDP=%s: cannot listen: %s", u, strerror(errno));
+        else LOG("front end: network pad (DM_PAD_UDP): listening on UDP port %d", g_net.port);
+    }
 }
 
 // Mouse as a single-point touchscreen (front.h dm_touch_set): left button down / drag = finger 0, release = lifted. The content view takes the clicks,
