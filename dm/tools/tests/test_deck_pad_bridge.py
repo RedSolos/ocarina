@@ -194,5 +194,122 @@ class Loop(unittest.TestCase):
         os.close(r); rx.close(); tx.close()
 
 
+
+def deck_report(low=0, high=0, tl=0, tr=0, ls=(0, 0), rs=(0, 0), rtype=9, packet=1):
+    """A Steam Deck state report as its hidraw device gives it (SDL's controller_structs.h: header, packet number, buttons, pads, IMU, triggers, sticks, pressures)."""
+    b = br.DECK.pack(1, rtype, 64, packet, low, high, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tl, tr, ls[0], ls[1], rs[0], rs[1], 0, 0)
+    return b + bytes(64 - len(b))
+
+
+class DeckController(unittest.TestCase):
+    def test_report_layout(self):
+        self.assertEqual(br.DECK.size, 60)                                  # 4 header + 56 of SteamDeckStatePacket_t; the report is 64
+        r = deck_report(tl=0x1234, ls=(-5, 7), rs=(9, -11))
+        self.assertEqual(r[:4], bytes([1, 0, 9, 64]))
+        self.assertEqual(struct.unpack_from('<H', r, 44)[0], 0x1234)        # sTriggerRawL at 44, as SDL's packed struct
+        self.assertEqual(struct.unpack_from('<4h', r, 48), (-5, 7, 9, -11))  # the sticks at 48
+
+    def test_faces_by_position_and_by_label(self):
+        d = br.DeckPad(br.Config(deadzone=0.0))
+        self.assertTrue(d.feed(deck_report(low=br.D_B | br.D_A | br.D_Y | br.D_X)))
+        self.assertEqual(d.snapshot()[0], br.A | br.B | br.X | br.Y)
+        d.feed(deck_report(low=br.D_B)); self.assertEqual(d.snapshot()[0], br.A)    # the right button is the Switch's A
+        d.feed(deck_report(low=br.D_A)); self.assertEqual(d.snapshot()[0], br.B)    # the bottom one its B
+        d.feed(deck_report(low=br.D_Y)); self.assertEqual(d.snapshot()[0], br.X)
+        n = br.DeckPad(br.Config(nintendo=True))
+        n.feed(deck_report(low=br.D_A)); self.assertEqual(n.snapshot()[0], br.A)
+
+    def test_other_buttons_and_what_stays_steams(self):
+        d = br.DeckPad(br.Config())
+        d.feed(deck_report(low=br.D_L | br.D_R | br.D_MENU | br.D_VIEW | br.D_L3 | br.D_R3 | br.D_UP | br.D_LEFT))
+        self.assertEqual(d.snapshot()[0], br.L | br.R | br.PLUS | br.MINUS | br.LS | br.RS | br.UP | br.LEFT)
+        d.feed(deck_report(low=br.D_STEAM | br.D_L2 | br.D_R2, high=0x40000 | 0x600))   # Steam, the digital trigger bits, Quick Access and the back grips
+        self.assertEqual(d.snapshot()[0], 0)
+
+    def test_triggers_and_sticks(self):
+        d = br.DeckPad(br.Config(deadzone=0.1, trigger=0.5))
+        d.feed(deck_report(tl=16000, tr=17000))
+        self.assertEqual(d.snapshot()[0], br.ZR)                            # past half way only on the right
+        d.feed(deck_report(ls=(32767, 0), rs=(0, 32767)))
+        self.assertEqual(d.snapshot()[1:], (32767, 0, 0, 32767))            # up stays positive, as the game takes it
+        d.feed(deck_report(ls=(2000, -2000)))
+        self.assertEqual(d.snapshot()[1:3], (0, 0))                         # inside the dead zone
+        d.feed(deck_report(ls=(-32768, 0)))
+        self.assertEqual(d.snapshot()[1], -32767)
+
+    def test_other_reports_are_skipped(self):
+        d = br.DeckPad(br.Config())
+        d.feed(deck_report(low=br.D_B))
+        self.assertFalse(d.feed(deck_report(rtype=4)))                      # a status report
+        self.assertFalse(d.feed(b'\x01\x00\x09'))
+        self.assertEqual(d.snapshot()[0], br.A)                             # the last state stays
+
+    def test_hidraw_devices_by_vendor_and_product(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, hid in (('hidraw0', '0003:000028DE:00001205'), ('hidraw1', '0003:0000045E:0000028E'), ('hidraw2', '0003:000028de:00001205')):
+                os.makedirs(os.path.join(d, name, 'device'))
+                Path(d, name, 'device', 'uevent').write_text(f'DRIVER=hid-steam\nHID_ID={hid}\nHID_NAME=Valve Software Steam Deck Controller\n')
+            self.assertEqual(br.deck_hidraws(d), ['/dev/hidraw0', '/dev/hidraw2'])
+        self.assertEqual(br.deck_hidraws('/nonexistent'), [])
+
+    def test_probe_picks_the_device_that_sends_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            quiet, talking = os.path.join(d, 'q'), os.path.join(d, 't')
+            os.mkfifo(quiet); os.mkfifo(talking)
+            keep = [os.open(quiet, os.O_RDWR), os.open(talking, os.O_RDWR)]   # writers, so opening them for reading does not block
+            os.write(keep[1], deck_report())
+            self.assertEqual(br.probe_deck([quiet, talking], wait=0.1), talking)
+            self.assertIsNone(br.probe_deck([quiet], wait=0.05))
+            for fd in keep:
+                os.close(fd)
+
+    def test_streaming_by_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            def proc(pid, argv):
+                os.makedirs(os.path.join(d, pid))
+                Path(d, pid, 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+            proc('1', ['/usr/lib/systemd/systemd'])
+            proc('22', ['/home/deck/.steam/steam/ubuntu12_32/steam', '-gamepadui'])
+            os.makedirs(os.path.join(d, 'self'))
+            self.assertFalse(br.streaming(d))
+            proc('33', ['/home/deck/.steam/steam/ubuntu12_64/streaming_client', '--some-arg'])
+            self.assertTrue(br.streaming(d))
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, '7'))
+            Path(d, '7', 'cmdline').write_bytes(b'/app/bin/SteamLink\0')
+            self.assertTrue(br.streaming(d))
+
+    def test_reports_on_a_pipe_become_datagrams(self):
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(('127.0.0.1', 0)); rx.settimeout(2.0)
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        def send(st):
+            tx.sendto(br.encode(1, st), rx.getsockname())
+        r, w = os.pipe()
+        stop = threading.Event()
+        t = threading.Thread(target=br.pump, args=(r, br.DeckPad(br.Config(deadzone=0.0)), send, stop.is_set, 0.05))
+        t.start()
+
+        def newest():
+            data = rx.recv(64)
+            while True:
+                rx.settimeout(0.05)
+                try:
+                    data = rx.recv(64)
+                except socket.timeout:
+                    break
+            rx.settimeout(2.0)
+            return struct.unpack('<I4h', data[8:])
+        self.assertEqual(newest(), (0, 0, 0, 0, 0))
+        for _ in range(5):   # a burst, as every 4 ms: the last one counts
+            os.write(w, deck_report(low=br.D_B, ls=(0, 32767)))
+        time.sleep(0.2)
+        self.assertEqual(newest(), (br.A, 0, 32767, 0, 0))
+        stop.set(); os.close(w); t.join(2.0)
+        self.assertFalse(t.is_alive())
+        os.close(r); rx.close(); tx.close()
+
+
 if __name__ == '__main__':
     unittest.main()
