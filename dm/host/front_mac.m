@@ -644,7 +644,7 @@ static void pads_start(void) {
     static const dm_switch2_front s2front = {s2pad_attach, s2pad_detach, s2pad_read, s2pad_player, s2pad_blocked};
     dm_switch2_start(&s2front);
     const char *u = getenv("DM_PAD_UDP");
-    if (u && *u) {
+    if (u && *u && strcmp(u, "0")) {   // 0: off (the settings list's toggle)
         if (pad_net_open(&g_net, u, net_pad_event, NULL)) LOG("[RED] DM_PAD_UDP=%s: cannot listen: %s", u, strerror(errno));
         else LOG("front end: network pad (DM_PAD_UDP): listening on UDP port %d", g_net.port);
     }
