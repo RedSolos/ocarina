@@ -16990,6 +16990,170 @@ static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLT
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) { MLOG("[RED] offscreen present: the GPU did not finish within 10 s"); return 0; }
     return kind;
 }
+// ---------- Frame generation (DM_FRAMEGEN), stage 1: the scheduling proof ----------
+// On a 120 Hz display link (DM_PRESENT_LINK=2) a game that presents every k-th tick (60 fps: k=2, 40 fps: k=3, 30 fps: k=4) leaves k-1
+// ticks between two frames that would show nothing new. With DM_FRAMEGEN=1 and a settled cadence k the display-link callback, on the tick
+// a frame is taken, shows instead the blend of the previous frame and this one (1/k of the way), then 2/k ... (k-1)/k on the ticks after
+// it, and the frame itself on the k-th: 120 presented pictures a second over 120/k real frames, the game's simulation untouched. k is
+// learned from the game's own presents (fg_cad_note: the gaps between frames reaching the queue, not between takes: an engaged take is
+// locked to its plan and could never read shorter than k) and capped by DM_FRAMEGEN_MAXK (2 to 4, default 4). Real frames land k-1
+// ticks (8.3 ms each) later, a constant delay of the host's own making, so it is not charged to the game: present_now records a held
+// frame's presented time shifted back by it, and the on-screen intervals the frame step judges (hle_nvn.c fstep_tick: differences of
+// mtl_presented_time) read exactly as without generation (the same principle as the display link's own latency, issues #347 / #348).
+// A generated present takes no ticket, writes no g_pres entry and does not count in g_present_n: hle's statistics stay "the game's nth
+// present" throughout. Generation engages only at a settled cadence and stays out of anything else: a cadence that moves (a frame step's
+// snap between 60 and 30 fps) steps it out at once and it re-learns, a swinging one never engages, a failed copy or blend presents as
+// before and resets the chain. The blend is a plain mix — ghosting on motion is expected, and more of it the larger k; judging the
+// picture is stage 2's work, not this stage's
+static int fg_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_FRAMEGEN"); on = e && strcmp(e, "0") != 0; if (on) MLOG("display link: frame generation on (DM_FRAMEGEN): blended frames between the real ones of a settled 2-, 3- or 4-tick cadence: 120 shown over 60, 40 or 30 real"); }
+    return on;
+}
+static int fg_maxk(void) {   // the largest cadence generation engages at: 2 (60 fps), 3 (40) or 4 (30); each step up adds a tick (8.3 ms) before a real frame lands and widens the blends
+    static int m = 0;
+    if (!m) { const char *e = getenv("DM_FRAMEGEN_MAXK"); m = e ? atoi(e) : 4; if (m < 2) m = 2; if (m > 4) m = 4; MLOG("display link: frame generation engages up to k=%d (DM_FRAMEGEN_MAXK)", m); }
+    return m;
+}
+static id<MTLRenderPipelineState> g_fg_pso; static MTLPixelFormat g_fg_fmt;
+static void fg_pipeline(MTLPixelFormat format) {   // the sampler (g_blit_samp) already exists: the history copy that precedes every blend ran the present's own pipeline build for it
+    if (!g_fg_pso || g_fg_fmt != format) {
+        NSError *e = nil;
+        id<MTLLibrary> lib = host_lib("present", &e);
+        if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs_blend"];
+        pd.colorAttachments[0].pixelFormat = format;
+        g_fg_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_fg_pso) MDIE("frame generation pipeline failed %s", e.localizedDescription.UTF8String);
+        g_fg_fmt = format;
+    }
+}
+// The last two real frames as the present would show them (its crop and fit, without the upscaler), in private textures in the raw
+// (non-sRGB) format of the swapchain's storage, so reads and writes move the stored bytes as the present's own do (present_raw_src).
+// Written and read on the display-link thread only; queue order orders a copy before the blend that samples it
+static id<MTLTexture> g_fg_hist[2], g_fg_scr[2]; static int g_fg_scr_i;   // the blends' scratch textures take turns (fg_blend_scratch)
+static id<MTLTexture> fg_hist_tex(id<MTLTexture> src, id<MTLTexture> cur) {
+    MTLPixelFormat pf = src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm : src.pixelFormat;
+    if (cur && cur.width == src.width && cur.height == src.height && cur.pixelFormat == pf) return cur;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:src.width height:src.height mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
+    if (t) { if (cur) defer_obj_unref(cur); res_add(t); }
+    return t;
+}
+// Copy the frame a present is about to show into a history slot, on its own command buffer committed before the blend that samples
+// it (the offscreen present's shape, present_offscreen_m4, but with no scaler state of its own: the generated frame is upscaled once,
+// by the present's own encode, like a real one). 0 = not submitted; the caller presents the frame as before and resets the chain
+static int fg_copy(const tex_t *t, const int crop[4], int slot) {
+    id<MTLTexture> src = tex_mtl(t);
+    if (!src) return 0;
+    id<MTLTexture> out = fg_hist_tex(src, g_fg_hist[slot]);
+    if (!out) return 0;
+    g_fg_hist[slot] = out;
+    id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+    if (!al || !cb || !uvb) { MLOG("[RED] frame generation: no command allocator or buffer for the history copy"); return 0; }
+    res_add(uvb); res_commit();
+    [cb beginCommandBufferWithAllocator:al];
+    int kind = present_encode_m4(cb, src, out, crop, uvb, NULL);
+    [cb endCommandBuffer];
+    if (!kind) { res_remove(uvb); return 0; }
+    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+        (void)al; (void)cb; res_remove(uvb);
+        if (f.error) { MLOG("[RED] frame generation history copy: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "frame generation"); }
+    }];
+    [g_q4 commit:&cb count:1 options:o];
+    return 1;
+}
+// The blend of the two history textures into a scratch texture, w the share of b (the current frame): both hold the whole picture (the
+// copy fitted it), so the whole of each is sampled. The scratch goes to the drawable through the present's own encode afterwards
+// (fg_present_blend), not here, so a failure here still leaves the caller's drawable untouched. Own command buffer, committed before that
+// encode. Two scratch textures take turns: with k > 2 a blend is written on each of several consecutive ticks, and the one a present may
+// still be reading must not be overwritten
+static int fg_blend_scratch(id<MTLTexture> a, id<MTLTexture> b, float w) {
+    int si = g_fg_scr_i ^ 1;
+    id<MTLTexture> sc = fg_hist_tex(a, g_fg_scr[si]);
+    if (!sc) return 0;
+    g_fg_scr[si] = sc; g_fg_scr_i = si;
+    id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];   // CropMix: the crop's two float4s and the blend's w
+    if (!al || !cb || !uvb) { MLOG("[RED] frame generation: no command allocator or buffer for the blend"); return 0; }
+    fg_pipeline(sc.pixelFormat);
+    res_add(uvb); res_commit();
+    [cb beginCommandBufferWithAllocator:al];
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = sc;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!en) { MLOG("[RED] failed to create the frame generation render encoder"); [cb endCommandBuffer]; res_remove(uvb); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
+    [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
+    [g_present_args setTexture:a.gpuResourceID atIndex:0];
+    [g_present_args setTexture:b.gpuResourceID atIndex:1];
+    [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
+    float *uv = uvb.contents; NSUInteger tw = a.width, th = a.height;
+    uv[0] = 0; uv[1] = 0; uv[2] = 1; uv[3] = 1;
+    uv[4] = 0.5f / tw; uv[5] = 0.5f / th; uv[6] = (tw - 0.5f) / tw; uv[7] = (th - 0.5f) / th;
+    if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // the present's own flip: the copies were drawn with it, so reading them the same way keeps the picture upright
+    uv[8] = w; uv[9] = uv[10] = uv[11] = 0;
+    [g_present_args setAddress:uvb.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){0, 0, (double)sc.width, (double)sc.height, 0, 1}];
+    [en setRenderPipelineState:g_fg_pso];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    m4_end(en);
+    [cb endCommandBuffer];
+    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+        (void)al; (void)cb; res_remove(uvb);
+        if (f.error) { MLOG("[RED] frame generation blend: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "frame generation"); }
+    }];
+    [g_q4 commit:&cb count:1 options:o];
+    return 1;
+}
+// Show the blended frame (w = the current frame's share) in the tick's drawable: the scratch through the present's own encode (the upscaler included, g_fx_present),
+// on a small allocator pool of its own (present_now's discipline), but no ticket, no presented handler, no g_present_n. Returns 1
+// when the blend was presented, 0 when the drawable was left untouched (the caller presents the real frame as before), -1 when the
+// drawable was consumed without a picture (the caller holds the real frame for the next tick instead)
+static id<MTL4CommandAllocator> g_fg_alloc4[3];
+static id<MTL4CommandBuffer> g_fg_present_cb[3];
+static id<MTLBuffer> g_fg_present_uv[3];
+static uint64_t g_fg_alloc_fence[3], g_fg_alloc_done[3], g_fg_seq; static int g_fg_alloc_i, g_fg_late;   // g_fg_late: the last fg_present_blend gave up waiting for the GPU (display-link thread only)   // the done half under g_pq_mu, as g_present_alloc_done
+static int fg_present_blend(id<CAMetalDrawable> dr, id<MTLTexture> prev, id<MTLTexture> cur, float w) {
+    if (!dr) return 0;
+    if (!fg_blend_scratch(prev, cur, w)) return 0;
+    if (!g_fg_alloc4[0]) { for (int i = 0; i < 3; i++) { g_fg_alloc4[i] = [g_dev newCommandAllocator]; g_fg_present_cb[i] = [g_dev newCommandBuffer]; g_fg_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; if (g_fg_present_uv[i]) res_add(g_fg_present_uv[i]); } if (!g_fg_alloc4[0]) return 0; }
+    int alloc_i = g_fg_alloc_i; g_fg_alloc_i = (g_fg_alloc_i + 1) % 3;
+    if (g_fg_alloc_fence[alloc_i]) {   // the GPU still owns this allocator: wait at most 2 ms. Blocking the display-link thread longer costs real ticks, so a late GPU means "back off", not "wait"
+        int late = 0;
+        pthread_mutex_lock(&g_pq_mu);
+        while (g_fg_alloc_done[alloc_i] < g_fg_alloc_fence[alloc_i]) { struct timespec rel = {0, 2000000}; if (pthread_cond_timedwait_relative_np(&g_pq_cv, &g_pq_mu, &rel)) { late = 1; break; } }
+        pthread_mutex_unlock(&g_pq_mu);
+        if (late) { g_fg_late = 1; return 0; }   // the drawable is untouched: the caller presents the real frame as before
+    }
+    [g_fg_alloc4[alloc_i] reset];
+    [g_q4 waitForDrawable:dr];
+    id<MTL4CommandBuffer> cb = g_fg_present_cb[alloc_i];
+    [cb beginCommandBufferWithAllocator:g_fg_alloc4[alloc_i]];
+    static const int whole[4] = {0};
+    int kind = present_encode_m4(cb, g_fg_scr[g_fg_scr_i], dr.texture, whole, g_fg_present_uv[alloc_i], &g_fx_present);
+    [cb endCommandBuffer];
+    if (!kind) { [g_q4 signalDrawable:dr]; return -1; }
+    uint64_t seq = ++g_fg_seq;
+    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+        if (f.error) { MLOG("[RED] frame generation command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "frame generation"); }
+        pthread_mutex_lock(&g_pq_mu); if (seq > g_fg_alloc_done[alloc_i]) g_fg_alloc_done[alloc_i] = seq; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+    }];
+    id<MTL4CommandBuffer> buffers[] = {cb};
+    [g_q4 commit:buffers count:1 options:o];
+    [g_q4 signalDrawable:dr];
+    g_fg_alloc_fence[alloc_i] = seq;
+    [dr present];
+    return 1;
+}
 // The present command buffer's GPU time (its commit feedback: from its first to its last command, the MetalFX scaler and the present pass), every 600 presents as p50 / p95, apart
 // for presents through MetalFX and through the bilinear pass. Under g_pq_mu (the feedback handler)
 static void present_gpu_note(double s, int fx) {
@@ -17002,7 +17166,7 @@ static void present_gpu_note(double s, int fx) {
     n[fx] = 0;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
-static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, double pres_adj) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
@@ -17112,12 +17276,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 signalDrawable:dr];
     g_present_alloc_fence[alloc_i] = ticket;
 #if TARGET_OS_SIMULATOR   // The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
-    (void)period; [dr present];
+    (void)period; (void)pres_adj; [dr present];
 #else
     uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
-        g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
+        g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt + pres_adj : -1};   // pres_adj: a frame generation held frame's delay (k-1 ticks), taken out so the on-screen intervals read as without generation (the callback passes it; 0 for every other present)
     }];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
     if (target_ts > 0) [dr present];
@@ -17140,7 +17304,101 @@ static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_e
 static void snap_commit_wait(uint64_t v);
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
-static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
+static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, double);
+// Frame generation's plan (fg_on): the take copies the frame and starts a plan of g_fg_plan_k ticks, blends on all but the last, the real
+// frame itself on the last. The real frame (g_fg_held) is taken from the queue and copied on the take's tick and presented on the plan's
+// last one; until then its ticket stays open and its texture pinned. g_fg_plan_left: the ticks still to show, the real frame's included
+// (1 = only the real frame remains). g_fg_last_slot: the history slot of the most recent copied frame (-1 = no chain)
+static pq_item g_fg_held; static uint64_t g_fg_held_ticket; static double g_fg_held_target; static int g_fg_have_held;
+static int g_fg_plan_k, g_fg_plan_left;
+static int g_fg_last_slot = -1;
+static const double fg_warm_first_s = 10.0;   // seconds of a settled cadence before the FIRST engagement of the process: the blend's one pipeline build stays out of the boot window (see the take branch)
+static const double fg_warm_again_s = 0.5;   // the same before later engagements: the build is done by then, so returning is cheap
+static const double fg_warm_cap_s = 10.0;   // the longest wait to re-engage after repeated back-offs
+static const double fg_cost_limit = 0.005;   // seconds one tick's generation work may take on the display-link thread before it counts as slow (a tick is 8.3 ms); tune by the back-off log line
+static const double fg_tick_s = 1.0 / 120.0;   // a tick of the 120 Hz link (DM_PRESENT_LINK=2): the unit the game's frame gaps are counted in
+static int g_fg_engaged, g_fg_warmed_once, g_fg_k;   // generated frames flowing; the first engagement has happened; the cadence they run at (fixed while engaged)
+static double g_fg_again_s;   // the wait before re-engaging now (0 = fg_warm_again_s)
+static int g_fg_slow, g_fg_run, g_fg_off;   // slow ticks in a row; real frames this engagement lasted; frames in a row off the plan's rhythm
+static double g_fg_base_s, g_fg_eng_t0; static int g_fg_eng_n;   // the game's mean frame time before engaging; the running check of it under generation
+static double g_fg_st_t; static int g_fg_st_plans, g_fg_st_off;   // the log line every few seconds
+// The cadence estimator: the gaps between the game's own presents (frames reaching the queue), in ticks, the last FG_WIN of them. Fed by
+// fg_cad_note from the display-link callback, so it keeps seeing the game even while an engaged plan locks the takes to itself
+#define FG_WIN 16
+static uint8_t g_fg_win[FG_WIN]; static int g_fg_win_i, g_fg_win_n;
+static int g_fg_k_est; static double g_fg_stable_since;   // the settled cadence (0 = none) and since when
+static double g_fg_arr_t; static uint64_t g_fg_seen_in;   // target time of the last arrival, and g_pq_in as last seen
+// Generation leaves its engaged state, however it came to: back to stock presents, a plan that is showing is cut to its real frame, and
+// the estimator starts over (it re-learns the cadence from fresh gaps, so nothing from before a change can decide anything after it)
+static void fg_leave(void) {
+    g_fg_engaged = 0; g_fg_run = 0; g_fg_off = 0; g_fg_slow = 0; g_fg_eng_t0 = 0; g_fg_last_slot = -1;
+    if (g_fg_have_held) g_fg_plan_left = 1;
+    g_fg_win_n = 0; g_fg_win_i = 0; g_fg_k_est = 0; g_fg_stable_since = 0;
+}
+// A break (the cadence went to pieces, a stall, the GPU could not keep up, the game slowed under generation): back to stock presents, and
+// the way back in waits. An engagement that ended before 300 real frames doubles that wait (up to fg_warm_cap_s), so a scene that keeps
+// breaking it, such as a long fight, stops being retried every half second; a long run resets the wait
+static void fg_backoff(const char *why) {
+    if (g_fg_engaged) {
+        double w = g_fg_run < 300 ? (g_fg_again_s > 0 ? g_fg_again_s : fg_warm_again_s) * 2 : fg_warm_again_s;
+        if (w > fg_warm_cap_s) w = fg_warm_cap_s;
+        g_fg_again_s = w;
+        MLOG("display link: frame generation disengaged (%s); back after %.1f s of a settled cadence", why, w);
+    }
+    fg_leave();
+}
+// The game moved its own cadence (a frame step's snap between 60 and 30 fps at the start and end of a fight): expected, not a fault, so it
+// costs no wait beyond re-learning. Generation steps out at once, so no blend ever crosses the step
+static void fg_shift(const char *why) {
+    if (g_fg_engaged) MLOG("display link: frame generation paused (%s); re-learning the cadence", why);
+    fg_leave();
+}
+// The load watchdog over one tick's generation work (t0 = 0: not timed): still busy with the previous generated frame, or three ticks in a
+// row over the time budget, and it backs off instead of pushing the game's frame time up and starving the ticks
+static void fg_watch(double t0) {
+    if (g_fg_late || (t0 > 0 && CACurrentMediaTime() - t0 > fg_cost_limit)) {
+        if (g_fg_late || ++g_fg_slow >= 3) fg_backoff(g_fg_late ? "the GPU was still busy with the previous generated frame" : "the generation work ran over its time budget");
+    } else g_fg_slow = 0;
+}
+static double fg_win_mean(void) { int n = g_fg_win_n; if (n <= 0) return 0; int s = 0; for (int i = 0; i < n; i++) s += g_fg_win[i]; return (double)s / n; }
+// Settled at k: the window's (lower) median gap is k, 2 <= k <= DM_FRAMEGEN_MAXK, and at least 85% of the gaps are within a tick of it.
+// A gap a tick short is a frame that waited for the plan, a tick long is jitter; anything else is no cadence. The median, not the
+// smallest gap: 30 fps is 4 ticks with the odd 3 and 5, and planning for the 3 would waste a tick of every 4
+static void fg_cad_eval(double now) {
+    if (g_fg_win_n < 12) { g_fg_k_est = 0; g_fg_stable_since = 0; return; }
+    uint8_t s[FG_WIN]; int n = g_fg_win_n;
+    for (int i = 0; i < n; i++) s[i] = g_fg_win[i];
+    for (int i = 1; i < n; i++) { uint8_t v = s[i]; int j = i - 1; while (j >= 0 && s[j] > v) { s[j + 1] = s[j]; j--; } s[j + 1] = v; }
+    int med = s[(n - 1) / 2], near = 0;
+    for (int i = 0; i < n; i++) if (s[i] + 1 >= med && s[i] <= med + 1) near++;
+    int kc = med; double mean = fg_win_mean();   // and not more ticks than the frames' mean spacing when that is clearly shorter: a plan longer than the frames take to come makes them queue and drop (45 fps is 2.7 ticks: k=2, with a held tick on the long gaps). The margin keeps a jittery 30 fps (mean 3.9 to 4.1) at 4
+    if (mean < med - 0.25) kc = (int)(mean + 0.25);
+    int k = (near * 100 >= n * 85 && kc >= 2 && kc <= fg_maxk()) ? kc : 0;
+    if (k && k == g_fg_k_est) return;   // still settled at the same k: its clock keeps running
+    g_fg_k_est = k; g_fg_stable_since = k ? now : 0;
+}
+// One arrival (a frame of the game reaching the queue), gap ticks after the previous one
+static void fg_cad_note(int gap, double now) {
+    int raw = gap;
+    if (gap > 12) gap = 12;
+    if (gap < 0) gap = 0;
+    g_fg_win[g_fg_win_i] = (uint8_t)gap; g_fg_win_i = (g_fg_win_i + 1) % FG_WIN; if (g_fg_win_n < FG_WIN) g_fg_win_n++;
+    fg_cad_eval(now);
+    if (!g_fg_engaged) return;
+    if (raw >= 24) { fg_backoff("a stall"); return; }   // a loading stall or a scene change: a real break, 200 ms with no frame
+    // The fast path: two frames in a row off the plan's rhythm are the game moving its cadence (a frame step: 60 to 30 at the start of a
+    // fight, back at its end), not a hitch — step out at once. A lone one is a hitch: the take shows that frame as it is
+    if (gap + 1 < g_fg_k || gap > g_fg_k + 1) { if (++g_fg_off >= 2) { fg_shift("the game's cadence moved"); return; } } else g_fg_off = 0;
+    if (!g_fg_k_est) { fg_backoff("the cadence broke"); return; }   // the window no longer holds a cadence: a real break
+    if (g_fg_k_est != g_fg_k) { if (now - g_fg_stable_since >= 1.0) fg_shift("the settled cadence changed"); return; }   // the slow path to the same end as the fast one: a different k that has held for a second (a passing flip of the estimate decides nothing)
+    // The game must not pay for generation: its frame time under generation against its frame time just before engaging, over 3 s runs
+    if (!g_fg_eng_t0) { g_fg_eng_t0 = now; g_fg_eng_n = 0; }
+    else if (++g_fg_eng_n >= 1 && now - g_fg_eng_t0 >= 3.0) {
+        double per = (now - g_fg_eng_t0) / g_fg_eng_n;
+        if (g_fg_base_s > 0 && per > g_fg_base_s * 1.12) { fg_backoff("the game's frame rate fell under generation"); return; }
+        g_fg_eng_t0 = now; g_fg_eng_n = 0;
+    }
+}
 static double g_link_vperiod, g_link_vhalf;   // virtual ticks (link_range): seconds per counted tick (0 = every callback is a tick) and half a refresh of the screen
 
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
@@ -17187,6 +17445,51 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
+    if (fg_on() && g_dm_present_link == 2 && g_pq_in != g_fg_seen_in) {   // the game's own cadence, read off the queue: when a frame first shows up, in ticks since the previous one. Independent of the takes, which an engaged plan locks to itself
+        uint64_t fg_n = g_pq_in - g_fg_seen_in; double fg_a = update.targetPresentationTimestamp;
+        if (g_fg_seen_in && g_fg_arr_t > 0) { fg_cad_note((int)((fg_a - g_fg_arr_t) / fg_tick_s + 0.5), CACurrentMediaTime()); for (uint64_t q = 1; q < fg_n && q < 4; q++) fg_cad_note(0, CACurrentMediaTime()); }
+        g_fg_seen_in = g_pq_in; g_fg_arr_t = fg_a;
+    }
+    if (g_fg_have_held && g_dm_present_link && !g_rescue_mode) {
+        // A tick of a frame generation plan, after its take. With more than the real frame left (g_fg_plan_left > 1) this tick shows the next
+        // blend, j/k of the way from the previous frame to the held one (run with g_pq_mu released: the blend waits on it, 2 ms at most); on
+        // the plan's last tick it shows the held frame itself. Not an empty tick and not a take: the queue is not read here, and no hold can
+        // be running (a held frame is only ever taken after the previous frame's hold expired, and generation never sets one). A blend that
+        // left the drawable untouched (the GPU late, a failed encode) shows the held frame now instead, ticks early. present_now is told the
+        // delay (the difference of the take's and this tick's target times: k-1 ticks) to take out of the frame's recorded presented time
+        if (g_fg_plan_left > 1 && g_fg_engaged && g_fg_last_slot >= 0 && update.drawable) {
+            int fk = g_fg_plan_k, fj = fk - g_fg_plan_left + 1, fsl = g_fg_last_slot;
+            pthread_mutex_unlock(&g_pq_mu);
+            g_fg_late = 0; double fg_t0 = CACurrentMediaTime();
+            int fb = fg_present_blend(update.drawable, g_fg_hist[fsl ^ 1], g_fg_hist[fsl], (float)fj / (float)fk);
+            fg_watch(fg_t0);
+            pthread_mutex_lock(&g_pq_mu);
+            if (!g_fg_have_held) { pthread_mutex_unlock(&g_pq_mu); return; }   // dropped (suspend) while the blend ran: nothing left to show
+            if (fb == 1 || fb < 0) { if (g_fg_plan_left > 1) g_fg_plan_left--; pthread_mutex_unlock(&g_pq_mu); return; }
+            g_fg_plan_left = 1;
+        }
+        pq_item hit = g_fg_held; uint64_t hticket = g_fg_held_ticket; double adj = g_fg_held_target - update.targetPresentationTimestamp; g_fg_have_held = 0; g_fg_plan_left = 0;
+        if (adj < -fg_tick_s * (g_fg_plan_k + 4)) {   // held far past its plan (the app was backgrounded, or the link stalled and recovered): drop it as not presented instead of flashing a stale frame; the correction above is only honest for a hold of a few ticks
+            g_pres[hticket % PRING] = (pres_ent){hticket, -1}; g_link_dropped++; g_fg_last_slot = -1;
+            pthread_mutex_unlock(&g_pq_mu);
+            mtl_tex_unpin(hit.t.serial);
+            return;
+        }
+        // The entry keeps the take's own counts: nticks and gap_max measure callbacks since the previous TAKE and belong to the next
+        // take's entry, so this present only refreshes when the frame was targeted and shown, and leaves the counters running
+        { link_ent le = g_link_ring[hticket % PRING]; le.target = update.targetPresentationTimestamp; le.lead_ms = (update.targetPresentationTimestamp - cb) * 1e3; g_link_ring[hticket % PRING] = le; }
+        pthread_mutex_unlock(&g_pq_mu);
+        int hsubmitted;
+        @autoreleasepool { hsubmitted = present_now(&hit.t, hit.period, hit.frame, hticket, hit.crop, update.drawable, update.targetPresentationTimestamp, adj); mtl_tex_unpin(hit.t.serial); }
+        g_link_hold_until = 0;   // the plan paces the ticks: a 30 fps frame's own hold (a whole period, 4 ticks) would swallow the next take
+        if (!hsubmitted) {
+            pthread_mutex_lock(&g_pq_mu);
+            if (hticket > g_pq_done) g_pq_done = hticket;
+            pthread_cond_broadcast(&g_pq_cv);
+            pthread_mutex_unlock(&g_pq_mu);
+        }
+        return;
+    }
     if (!g_dm_present_link || g_rescue_mode || g_pq_read == g_pq_in) { if (g_dm_present_link && !g_rescue_mode) g_link_empty++; pthread_mutex_unlock(&g_pq_mu); return; }
     // The previous frame's present interval was >= 2 (period > 25 ms): keep it on screen for its whole period before taking the next one, as the Switch flips only every N vertical syncs. This also holds while the link runs at 60 Hz (Mario 1.2.1 sets 2 for single frames, see nvn_game_fps in hle_nvn.c);
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
@@ -17201,13 +17504,62 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     g_pq_read = ticket;
     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
+    int fg_ticks = nticks;
     g_link_ring[ticket % PRING] = (link_ent){ticket, update.targetPresentationTimestamp, (update.targetPresentationTimestamp - cb) * 1e3, gap_max * 1e3, nticks}; nticks = 0; gap_max = 0;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
-    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); mtl_tex_unpin(it.t.serial); }
-    g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
+    // Frame generation (fg_on): with a settled cadence k (the game's own presents 2, 3 or 4 ticks apart: fg_cad_note), do not show this
+    // frame yet — copy it, show the blend of it and the previous frame (1/k of the way) on this tick, and hold the frame itself for the
+    // plan's last tick, k-1 ticks on (the held branch above shows the blends in between, then the frame). A take k ticks after the previous
+    // one is the metronome; k+1 is ordinary jitter (the frame lands a tick late and the last picture stays a tick longer) and still plans;
+    // anything else is a frame off the rhythm (a hitch, a busy scene): shown as it is, with no blend across the gap, and generation stays
+    // engaged — the cadence estimator decides whether the cadence itself moved (fg_shift: at once, no wait to come back) or broke
+    // (fg_backoff: the way back waits). A tick whose generation work overran its budget or found the GPU still busy with the last generated
+    // frame backs off too (fg_watch). Engagement itself is gated: the FIRST one waits for fg_warm_first_s of a settled cadence (~10 s),
+    // later ones for fg_warm_again_s (~0.5 s). The long first wait is a stopgap for a crash seen on this path (Ocarina of Time, base
+    // M5): seconds after the generation line, the host took a SIGSEGV at 0xe8 in fscache_find_and_retain
+    // (MTLCompilerFSCache::getElementImpl), on a shader-prefetch worker inside newArgumentEncoderWithBufferIndex, while the
+    // generation command buffers reported no error — the suspected cause is a Metal compiler-cache fault under the boot window's
+    // concurrent compile load (the blend's own pipeline build among it), which this code cannot fix; keeping that one build out of
+    // the boot and loading windows removes the observed overlap, but the trigger is not proven. Once the build exists, re-engaging
+    // compiles nothing, so it can afford to be quick and to ride through jitter instead of dropping out under it. A copy or blend
+    // that fails before touching the drawable falls through to the ordinary present; one that consumed the drawable holds the
+    // frame anyway, and this tick keeps the previous picture
+    int fg_mode_ok = fg_on() && g_dm_present_link == 2;   // the 120 Hz link; another link rate is a real mode change
+    if (fg_on() && !fg_mode_ok) fg_backoff("the link mode changed");
+    if (fg_mode_ok && !g_fg_engaged && g_fg_k_est >= 2 && g_fg_stable_since > 0 && fg_ticks >= g_fg_k_est && fg_ticks <= g_fg_k_est + 1) {
+        double fg_now = CACurrentMediaTime(), fg_need = g_fg_warmed_once ? (g_fg_again_s > 0 ? g_fg_again_s : fg_warm_again_s) : fg_warm_first_s;
+        if (fg_now - g_fg_stable_since >= fg_need) {
+            g_fg_engaged = 1; g_fg_warmed_once = 1; g_fg_k = g_fg_k_est; g_fg_run = 0; g_fg_off = 0; g_fg_eng_t0 = 0; g_fg_st_t = fg_now; g_fg_st_plans = g_fg_st_off = 0;
+            g_fg_base_s = fg_win_mean() * fg_tick_s;
+            MLOG("display link: frame generation engaged at k=%d (about %.0f real fps) after %.1f s of a settled cadence", g_fg_k, g_fg_base_s > 0 ? 1.0 / g_fg_base_s : 0.0, fg_now - g_fg_stable_since);
+        }
+    }
+    if (g_fg_engaged) {
+        double fg_now = CACurrentMediaTime();
+        if (fg_now - g_fg_st_t >= 5.0) { MLOG("display link: frame generation k=%d: %d planned, %d off the rhythm in %.0f s", g_fg_k, g_fg_st_plans, g_fg_st_off, fg_now - g_fg_st_t); g_fg_st_t = fg_now; g_fg_st_plans = g_fg_st_off = 0; }
+    }
+    if (g_fg_engaged && (fg_ticks < g_fg_k || fg_ticks > g_fg_k + 1)) { g_fg_last_slot = -1; g_fg_st_off++; }   // a frame off the plan's rhythm: shown as it is, no blend across the gap, still engaged
+    else if (g_fg_engaged) {
+        g_fg_run++; g_fg_st_plans++;
+        int slot = g_fg_last_slot < 0 ? 0 : g_fg_last_slot ^ 1;
+        double fg_t0 = CACurrentMediaTime(); g_fg_late = 0;
+        if (fg_copy(&it.t, it.crop, slot)) {
+            int seeded = g_fg_last_slot < 0;
+            int blended = seeded ? 0 : fg_present_blend(update.drawable, g_fg_hist[g_fg_last_slot], g_fg_hist[slot], 1.0f / (float)g_fg_k);
+            g_fg_last_slot = slot;
+            fg_watch(seeded ? 0 : fg_t0);   // load watchdog: generation costs GPU time and display-link thread time, and the game's own frames need both
+            if (blended == 1 || blended < 0) {
+                g_fg_held = it; g_fg_held_ticket = ticket; g_fg_held_target = update.targetPresentationTimestamp; g_fg_have_held = 1;
+                g_fg_plan_k = g_fg_k; g_fg_plan_left = g_fg_engaged ? g_fg_k - 1 : 1;   // (a watchdog back-off just now cuts the plan to its real frame)
+                return;
+            }
+        } else g_fg_last_slot = -1;
+    }
+    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, 0); mtl_tex_unpin(it.t.serial); }
+    g_link_hold_until = submitted && it.period > 0.025 && !g_fg_engaged ? update.targetPresentationTimestamp + it.period : 0;   // engaged: the plan paces the ticks, and a 30 fps frame's own hold (a whole period, 4 ticks) would swallow the next take
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
@@ -17317,12 +17669,20 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     applied = want;
     pthread_mutex_lock(&g_pq_mu); pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
 }
+// A frame generation held frame dropped unseen (suspend): accounted as dropped, like the queued frames below, and its chain reset
+static void fg_drop_held(void) {   // under g_pq_mu
+    if (!g_fg_have_held) return;
+    g_pres[g_fg_held_ticket % PRING] = (pres_ent){g_fg_held_ticket, -1};
+    mtl_tex_unpin(g_fg_held.t.serial);
+    g_fg_have_held = 0; g_fg_last_slot = -1;
+}
 // Before going to the background (mtl_drain): when the display link drives presents, frames queued but not yet presented can only be taken by the display-link callback, and in the background the system no longer calls back --
 // waiting as-is for "the present queue to empty" would wait forever, the enter-background callback would not return, and the system would kill the process (the process disappears within 22 seconds after switching to another App).
 // These frames will not be seen anyway: discard them directly (accounted as dropped frames) and only wait for the one present already submitted to the GPU to finish.
 static void present_drop_for_suspend(void) {
     pthread_mutex_lock(&g_pq_mu);
     if (g_link_owns_layer) {
+        fg_drop_held();
         uint64_t n = g_pq_in - g_pq_read;
         for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); }
         g_link_dropped += n; g_pq_read = g_pq_in;
@@ -17346,7 +17706,7 @@ static void *present_main(void *arg) {
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
         ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
-        @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); mtl_tex_unpin(it.t.serial); }
+        @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0, 0); mtl_tex_unpin(it.t.serial); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
             pthread_mutex_lock(&g_pq_mu);
