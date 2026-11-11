@@ -5,7 +5,7 @@ The screen before the game starts shows the settings the game supports. A settin
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Fixed resolution](#fixed-resolution), [Output](#output), [Resolution](#resolution), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Sharpening](#sharpening), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join), [Network controller](#network-controller)
-- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Present thread deadline](#present-thread-deadline), [120 Hz presents](#120-hz-presents), [Frame generation](#frame-generation), [Keep the screen at 120 Hz in fullscreen](#keep-the-screen-at-120-hz-in-fullscreen), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
@@ -241,6 +241,22 @@ flowchart LR
 
 Shown for games drawn through NVN. How much of the device's memory the game plans for. **Automatic**, the default, plans for all the device has. A number of GB (8, 12, 16, 18, 24, 32) plans for a device of that size: the host's memory guard then begins to let go of the textures a game has stopped using at a lower level, and fewer are made ahead of their first use, which leaves room for other apps and can make an area change cost a little more. A value at or above the device's own memory changes nothing, and the setting does not move the point where the host ends a game that is about to run the device out of memory. `DM_MEMORY_GB` takes `auto` or any number of GB.
 
+### Present thread deadline
+
+Mac only, on by default. On, the thread that hands frames to the screen declares a per-frame time budget to macOS, which it learns from recent frames. Where a scene needs much more than the budget learned in light scenes, macOS throttles the thread for overrunning it: Ocarina of Time's Hyrule Castle market ran at 10 to 16 fps on a base M5 with it on, and at 60 with it off ([issue #1985](https://github.com/seedds/nxnative/issues/1985)). `DM_RT=0`.
+
+### 120 Hz presents
+
+Mac only, off by default. On, frames go to the screen on a 120 Hz display link, a game at 60 fps every other tick (`DM_PRESENT_LINK=2`). Needs a 120 Hz screen. Off leaves the choice to the app (a variable-refresh screen in fullscreen can still take it).
+
+### Frame generation
+
+Mac only, off by default, under 120 Hz presents. Where the game's frames settle 2, 3 or 4 ticks apart (60, 40 or 30 fps), the ticks between them show blends of the previous frame and the current one, so the screen shows about 120 pictures a second; the game itself runs and paces as before. Each real frame lands one to three ticks (8.3 ms each) later, and fast motion can ghost. A game whose frame rate swings is left alone. `DM_FRAMEGEN=1`; `DM_FRAMEGEN_MAXK=3` stops at 40 fps instead of 30. From PrashantJi02's [frame generation patch](https://github.com/PrashantJi02/Blond-Peter-Pan-nxnative-improvent), tested by its author on a base M5 with Ocarina of Time.
+
+### Keep the screen at 120 Hz in fullscreen
+
+Mac only, under 120 Hz presents. In fullscreen a screen whose rate is not a multiple of the game's switches to one that is, and a ProMotion screen drops to 60 Hz for a 60 fps game, which leaves 120 Hz presents and frame generation nothing to show on. On keeps the screen's own rate (`DM_SCREEN_MATCH=0`).
+
 ### Performance HUD
 
 Apple's performance overlay over the game: frame rate, frame and GPU times, memory. Useful to see what a setting changes; leave it off for play.
@@ -318,6 +334,10 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
 | Memory | `DM_MEMORY_GB` | `auto`, `8`, `12`, `16`, `18`, `24`, `32` |
+| Present thread deadline (Mac) | `DM_RT` | `1`, `0` |
+| 120 Hz presents (Mac) | `DM_PRESENT_LINK` | `2`, `1` |
+| Frame generation (Mac) | `DM_FRAMEGEN` | `1`, `0` |
+| Keep the screen at 120 Hz in fullscreen (Mac) | `DM_SCREEN_MATCH` | `0`, `1` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 
 `DM_LAUNCHER=0` skips the settings screen; the choices you saved there still apply. `DM_SAVED_CHOICES=0` starts with the tested defaults and keeps your saved choices for later. How the settings are listed for each game: [dm/games/settings.tsv](../dm/games/settings.tsv).

@@ -43,4 +43,8 @@ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first st
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
 DM_MEMORY_GB	choice	auto=Automatic,8=8 GB,12=12 GB,16=16 GB,18=18 GB,24=24 GB,32=32 GB	auto	gfxapi:nvn	Performance	Memory	How much of the device's memory the game plans for. Lower than the device has: textures are let go sooner, with more room for other apps.
+DM_RT	toggle	1/0	1	platform:mac	Performance	Present thread deadline	Off can fix a scene that stays slow on light Macs (Ocarina of Time's market on a base M5).
+DM_PRESENT_LINK	toggle	2/1	0	platform:mac	Performance	120 Hz presents	Needs a 120 Hz screen.
+DM_FRAMEGEN	toggle	-	0	platform:mac	Performance	Frame generation	Blended frames between real ones: smoother motion, 8 to 25 ms more latency, some ghosting.	needs=DM_PRESENT_LINK=2
+DM_SCREEN_MATCH	toggle	0/1	0	platform:mac	Performance	Keep the screen at 120 Hz in fullscreen		needs=DM_PRESENT_LINK=2
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
